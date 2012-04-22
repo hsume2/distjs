@@ -1,0 +1,240 @@
+#!/usr/bin/env node
+
+var program = require('commander'),
+    path = require('path'),
+    resolve = require('path').resolve,
+    fs = require('fs'),
+    childProcess = require('child_process'),
+    npm = require('npm'),
+    temp = require('temp'),
+    colors = require('colors'),
+    string = require('string'),
+    pwd = process.cwd();
+
+// program
+
+program
+  .version('0.0.1')
+  .usage('[options] [package.json]')
+  .option('-f, --force', 'Force rebuild of all dependencies.')
+  .option('-c, --clean', 'Cleans dist before building.')
+  .parse(process.argv);
+
+// phase 1: find dependencies
+
+var path = resolve(program.args.shift() || 'package.json');
+var dependencies;
+var total;
+var running;
+var root;
+
+fs.readFile(path, 'utf8', function (err, data) {
+  if (err) {
+    return console.log(err);
+  }
+  findDependencies(data);
+});
+
+function findDependencies(data) {
+  data = JSON.parse(data);
+  dependencies = data['dependencies'];
+  total = running = Object.keys(dependencies).length + 1;
+  findModulePaths();
+}
+
+// phase 2: find module paths
+
+function findModulePaths() {
+  npm.load({}, function() {
+    npm.commands.ls({}, true, function(er, rt) {
+      root = rt;
+      var deps = rt['dependencies'];
+
+      forEachModule(function(key) {
+        var dep = deps[key];
+        if(typeof dep == 'string') {
+          console.log(key.green + ': please run npm install');
+        } else {
+          decideBuildStatus(dep);
+        }
+      });
+
+      decideBuildStatus(rt);
+    });
+  });
+}
+
+function forEachModule(callback) {
+  var keys = Object.keys(dependencies);
+  keys.forEach(callback);
+}
+
+// phase 3: decide on build status
+
+var tempDir;
+
+function decideBuildStatus(dep) {
+  if(program.clean) {
+    var fileName = moduleDistFile(dep);
+    console.log(dep.realName.green + ': cleaning ' + fileName);
+    fs.unlinkSync(fileName);
+  }
+  checkDistStatus(dep, function() {
+    console.log(dep.realName.green + ': missing dist');
+    buildModule(dep);
+  }, function() {
+    if(program.force) {
+      console.log(dep.realName.green + ': forced build');
+      buildModule(dep);
+    } else {
+      console.log(dep.realName.green + ': dist ok');
+      markDistOk(dep);
+    }
+  });
+}
+
+function moduleDistFile(dep) {
+  var fileName = distConfig(dep, 'fileName');
+  var distFile;
+  if(fileName) {
+    distFile = fileName;
+  } else {
+    distFile = dep.realName + '.js';
+  }
+
+  return dep.realPath + '/dist/' + distFile;
+}
+
+function checkDistStatus(dep, failure, success) {
+  var checks = 2;
+  var fileName = moduleDistFile(dep);
+  var anyErrors;
+
+  var done = function() {
+    if(checks == 0) {
+      if(anyErrors) {
+        failure && failure();
+      } else {
+        success && success();
+      }
+    }
+  }
+
+  fs.stat(fileName, function(err, stat) {
+    checks--;
+    if(err) {
+      anyErrors = true;
+    }
+    done();
+  });
+
+  fs.readFile(fileName, function(err, data) {
+    checks--;
+    if(err) {
+      anyErrors = true;
+    }
+    if(!data || data.toString().trim().length == 0) {
+      if(!anyErrors) {
+        console.log(dep.realName.green + ': contents of dist are empty. this is not sane!');
+      }
+      anyErrors = true;
+    }
+    done();
+  });
+}
+
+// phase 4: try building module
+
+var okayDependencies = [];
+
+function distConfig(dep, key) {
+  var distConfigs = root['dist'];
+  if(distConfigs && distConfigs[dep.realName]) {
+    var distConfig = distConfigs[dep.realName];
+    if(distConfig && distConfig[key]) {
+      return distConfig[key];
+    }
+  }
+  return null;
+}
+
+function makeTarget(dep) {
+  var target = distConfig(dep, 'make');
+  if(target) {
+    return target;
+  }
+  return 'build';
+}
+
+function buildModule(dep) {
+  if(!tempDir) {
+    tempDir = temp.mkdirSync({ prefix: 'distjs' });
+  }
+  var command = 'npm install && make ' + makeTarget(dep);
+  console.log(dep.realName.green + ': executing ' + command);
+
+  var log = fs.createWriteStream(tempDir + '/' + dep.realName + '.log');
+  var build = childProcess.exec(command, { cwd: dep.realPath });
+
+  build.stdout.pipe(log);
+  build.stderr.pipe(log);
+
+  build.on('exit', function (code) {
+    checkDistStatus(dep, function() {
+      if(code != 0) {
+        console.log(dep.realName.green + ': build failed, code: ' + code.toString().red);
+      }
+      console.log(dep.realName.green + ': build failed, expected ' + moduleDistFile(dep) + ' to be generated');
+      console.log(dep.realName.green + ': Additional logging details at ' + tempDir.underline.bold);
+      markDistNotOk(dep);
+    }, function() {
+      console.log(dep.realName.green + ': build ok');
+      markDistOk(dep);
+    });
+  });
+}
+
+function markDistOk(dep) {
+  okayDependencies.push(dep);
+  running--;
+  check();
+}
+
+function markDistNotOk(dep) {
+  running--;
+  check();
+}
+
+function check() {
+  if(running == 0) {
+    if(okayDependencies.length == total) {
+      finalConcat();
+    } else {
+      console.log('failed :('.red);
+    }
+  }
+}
+
+// phase 5: final concat
+
+function finalConcat() {
+  var deps = okayDependencies.filter(function(dep) {
+    return dep != root;
+  });
+
+  var global = string(root.realName).camelize();
+
+  var str = string(root.realName).camelize() + " = (function() {\n\n";
+
+  str += deps.concat(root).map(function(dep) {
+    var distFile = moduleDistFile(dep);
+    return fs.readFileSync(distFile);
+  }).join('\n');
+
+  str += "\n  return " + global + ";\n";
+  str += "}());\n";
+
+  fs.writeFileSync('dist/' + root.realName + '.js', str);
+
+  console.log('done!'.blue);
+}
